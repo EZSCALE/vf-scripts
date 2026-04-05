@@ -171,16 +171,19 @@ DB_NAME=""
 
 # Source storage
 SRC_STORAGE_ID=""
+SRC_HV_STORAGE_ID=""
+SRC_IS_MOUNTPOINT=false
+SRC_PATH=""
 SRC_STORAGE_NAME=""
 
 # Destination format
 DEST_FORMAT="raw"
 
 # Blockcopy tuning defaults
-BLOCKCOPY_TIMEOUT=10800         # 3 hours
+BLOCKCOPY_TIMEOUT=43200         # 12 hours
 BLOCKCOPY_BUF_SIZE=134217728    # 128MB (tuned for 10G)
 MAX_RETRIES=2
-POLL_INTERVAL=10
+POLL_INTERVAL=5
 
 # CLI flags
 AUTO_YES=false
@@ -203,6 +206,7 @@ declare -A HV_IPS=()            # HV_IPS[id]=ip
 declare -A HV_DST_STORAGE=()    # HV_DST_STORAGE[id]=storage_id
 declare -A HV_DST_HV_STORAGE=() # HV_DST_HV_STORAGE[id]=hv_storage_id
 declare -A HV_DST_PATHS=()      # HV_DST_PATHS[id]=path
+declare -A HV_DST_IS_MOUNTPOINT=() # HV_DST_IS_MOUNTPOINT[id]=true/false
 declare -a HV_IDS=()            # Ordered list of configured hypervisor IDs
 
 # Interrupt tracking — for safe cleanup on SIGINT/SIGTERM
@@ -433,12 +437,14 @@ load_config() {
         local dst_storage_var="HV_${hv_id}_DST_STORAGE_ID"
         local dst_hv_storage_var="HV_${hv_id}_DST_HV_STORAGE_ID"
         local dst_path_var="HV_${hv_id}_DST_PATH"
+        local dst_mp_var="HV_${hv_id}_DST_IS_MOUNTPOINT"
 
         HV_NAMES[$hv_id]="${!name_var}"
         HV_IPS[$hv_id]="${!ip_var}"
-        HV_DST_STORAGE[$hv_id]="${!dst_storage_var}"
+        HV_DST_STORAGE[$hv_id]="${!dst_storage_var:-}"
         HV_DST_HV_STORAGE[$hv_id]="${!dst_hv_storage_var}"
         HV_DST_PATHS[$hv_id]="${!dst_path_var}"
+        HV_DST_IS_MOUNTPOINT[$hv_id]="${!dst_mp_var:-false}"
     done
 
     return 0
@@ -470,8 +476,11 @@ save_config() {
 VFDATA="$VFDATA"
 
 # Source storage (what we're migrating FROM)
-SRC_STORAGE_ID=$SRC_STORAGE_ID
+SRC_STORAGE_ID=${SRC_STORAGE_ID:-}
+SRC_HV_STORAGE_ID=${SRC_HV_STORAGE_ID:-}
+SRC_IS_MOUNTPOINT=$SRC_IS_MOUNTPOINT
 SRC_STORAGE_NAME="$SRC_STORAGE_NAME"
+SRC_PATH="$SRC_PATH"
 
 # Destination format (raw, qcow2, preserve)
 DEST_FORMAT="$DEST_FORMAT"
@@ -486,9 +495,10 @@ CONFIGEOF
 
 HV_${hv_id}_NAME="${HV_NAMES[$hv_id]}"
 HV_${hv_id}_IP="${HV_IPS[$hv_id]}"
-HV_${hv_id}_DST_STORAGE_ID=${HV_DST_STORAGE[$hv_id]}
+HV_${hv_id}_DST_STORAGE_ID=${HV_DST_STORAGE[$hv_id]:-}
 HV_${hv_id}_DST_HV_STORAGE_ID=${HV_DST_HV_STORAGE[$hv_id]}
 HV_${hv_id}_DST_PATH="${HV_DST_PATHS[$hv_id]}"
+HV_${hv_id}_DST_IS_MOUNTPOINT=${HV_DST_IS_MOUNTPOINT[$hv_id]}
 HVEOF
     done
 
@@ -548,7 +558,7 @@ validate_schema() {
     fi
 
     # Required columns on storage
-    if ! vfdb_quiet "SELECT id, name, path FROM storage LIMIT 1"; then
+    if ! vfdb_quiet "SELECT id, name, data_1 FROM storage LIMIT 1"; then
         err "Missing columns on 'storage' table (need: id, name, path)"
         ((errors++))
     fi
@@ -610,8 +620,7 @@ preflight() {
         done
 
         # Source path accessible
-        local src_path
-        src_path=$(vfdb "SELECT path FROM storage WHERE id = $SRC_STORAGE_ID" | head -1)
+        local src_path="$SRC_PATH"
         if [ -n "$src_path" ]; then
             if hv_ssh "$hv_ip" "test -d '$src_path'" 2>/dev/null; then
                 log "  [OK] Source path $src_path accessible on $hv_name"
@@ -691,79 +700,131 @@ do_setup() {
     echo
 
     # --- Step 2: Show available storage backends ---
+    # Show both datastore (storage table) and mountpoint (hypervisor_storage) entries
     echo -e "${BOLD}[2/6] Available storage backends:${NC}"
 
+    # Datastores (type=storage, linked to storage table)
     local storage_list
     storage_list=$(vfdb "
-        SELECT s.id, s.name, s.path,
+        SELECT CONCAT('S', s.id) AS ref, s.name, s.data_1 AS path, 'datastore' AS stype,
                COUNT(DISTINCT sd.server_id) AS vm_count
         FROM storage s
         LEFT JOIN hypervisor_storage hs ON hs.storage_id = s.id
         LEFT JOIN server_disks sd ON sd.hypervisor_storage_id = hs.id AND sd.deleted_at IS NULL
-        GROUP BY s.id, s.name, s.path
+        GROUP BY s.id, s.name, s.data_1
         ORDER BY s.id
     ")
 
-    if [ -z "$storage_list" ]; then
+    # Mountpoints (type=mountpoint, path on hypervisor_storage directly)
+    local mount_list
+    mount_list=$(vfdb "
+        SELECT CONCAT('M', hs.id) AS ref, hs.name, hs.path, 'mountpoint' AS stype,
+               COUNT(DISTINCT sd.server_id) AS vm_count
+        FROM hypervisor_storage hs
+        LEFT JOIN server_disks sd ON sd.hypervisor_storage_id = hs.id AND sd.deleted_at IS NULL
+        WHERE hs.type = 'mountpoint'
+        GROUP BY hs.id, hs.name, hs.path
+        ORDER BY hs.id
+    ")
+
+    if [ -z "$storage_list" ] && [ -z "$mount_list" ]; then
         err "  No storage backends found in database."
         exit 1
     fi
 
-    printf "  ${BOLD}%-4s %-30s %-40s %s${NC}\n" "ID" "Name" "Path" "VMs"
-    while IFS=$'\t' read -r s_id s_name s_path s_vms; do
-        [ -z "$s_id" ] && continue
-        printf "  %-4s %-30s %-40s %s\n" "$s_id" "$s_name" "$s_path" "$s_vms"
-    done <<< "$storage_list"
+    printf "  ${BOLD}%-6s %-30s %-30s %-12s %s${NC}\n" "ID" "Name" "Path" "Type" "VMs"
+    local all_list="${storage_list}"
+    [ -n "$mount_list" ] && all_list="${all_list}
+${mount_list}"
+    while IFS=$'\t' read -r s_ref s_name s_path s_type s_vms; do
+        [ -z "$s_ref" ] && continue
+        printf "  %-6s %-30s %-30s %-12s %s\n" "$s_ref" "$s_name" "$s_path" "$s_type" "$s_vms"
+    done <<< "$all_list"
     echo
 
-    echo -en "  Select ${BOLD}SOURCE${NC} storage ID to migrate FROM: "
-    read -r SRC_STORAGE_ID
+    echo -en "  Select ${BOLD}SOURCE${NC} storage ID to migrate FROM (e.g. S7 for datastore, M28 for mountpoint): "
+    read -r SRC_REF
 
-    # Validate input is an integer (prevents SQL injection)
-    if ! [[ "$SRC_STORAGE_ID" =~ ^[0-9]+$ ]]; then
-        err "  Invalid input — must be a numeric storage ID."
+    # Parse the reference — S=storage table, M=mountpoint hypervisor_storage
+    SRC_IS_MOUNTPOINT=false
+    if [[ "$SRC_REF" =~ ^S([0-9]+)$ ]]; then
+        SRC_STORAGE_ID="${BASH_REMATCH[1]}"
+        SRC_STORAGE_NAME=$(vfdb "SELECT name FROM storage WHERE id = $SRC_STORAGE_ID" | head -1)
+        SRC_PATH=$(vfdb "SELECT data_1 FROM storage WHERE id = $SRC_STORAGE_ID" | head -1)
+        if [ -z "$SRC_STORAGE_NAME" ]; then
+            err "  Storage ID $SRC_STORAGE_ID not found."
+            exit 1
+        fi
+        info "  Source: $SRC_STORAGE_NAME (datastore ID: $SRC_STORAGE_ID, path: $SRC_PATH)"
+    elif [[ "$SRC_REF" =~ ^M([0-9]+)$ ]]; then
+        SRC_IS_MOUNTPOINT=true
+        SRC_HV_STORAGE_ID="${BASH_REMATCH[1]}"
+        SRC_STORAGE_NAME=$(vfdb "SELECT name FROM hypervisor_storage WHERE id = $SRC_HV_STORAGE_ID" | head -1)
+        SRC_PATH=$(vfdb "SELECT path FROM hypervisor_storage WHERE id = $SRC_HV_STORAGE_ID" | head -1)
+        if [ -z "$SRC_STORAGE_NAME" ]; then
+            err "  Mountpoint ID $SRC_HV_STORAGE_ID not found."
+            exit 1
+        fi
+        info "  Source: $SRC_STORAGE_NAME (mountpoint ID: $SRC_HV_STORAGE_ID, path: $SRC_PATH)"
+    else
+        err "  Invalid input — use S<id> for datastore or M<id> for mountpoint (e.g. S7, M28)."
         exit 1
     fi
-
-    # Validate source storage exists
-    SRC_STORAGE_NAME=$(vfdb "SELECT name FROM storage WHERE id = $SRC_STORAGE_ID" | head -1)
-    if [ -z "$SRC_STORAGE_NAME" ]; then
-        err "  Storage ID $SRC_STORAGE_ID not found."
-        exit 1
-    fi
-    info "  Source: $SRC_STORAGE_NAME (ID: $SRC_STORAGE_ID)"
     echo
 
     # --- Step 3: Show hypervisors using this storage ---
-    echo -e "${BOLD}[3/6] Hypervisors using storage $SRC_STORAGE_ID ($SRC_STORAGE_NAME):${NC}"
+    echo -e "${BOLD}[3/6] Hypervisors using $SRC_STORAGE_NAME:${NC}"
 
     # Find hypervisors that have VMs with disks on the source storage
     local hv_list
-    hv_list=$(vfdb "
-        SELECT DISTINCT h.id, h.name, h.ip_address,
-               COUNT(DISTINCT s.id) AS vm_count
-        FROM hypervisors h
-        JOIN servers s ON s.hypervisor_id = h.id
-        JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
-        JOIN server_disks_storage sds ON sds.id = sd.disk_storage_id
-        WHERE sds.storage_id = $SRC_STORAGE_ID
-        GROUP BY h.id, h.name, h.ip_address
-        ORDER BY h.id
-    ")
-
-    if [ -z "$hv_list" ]; then
-        # Maybe no VMs yet, but still show hypervisors with this storage configured
+    if $SRC_IS_MOUNTPOINT; then
         hv_list=$(vfdb "
-            SELECT DISTINCT h.id, h.name, h.ip_address, 0 AS vm_count
+            SELECT DISTINCT h.id, h.name, h.ip_address,
+                   COUNT(DISTINCT s.id) AS vm_count
             FROM hypervisors h
-            JOIN hypervisor_storage hs ON hs.hypervisor_id = h.id
-            WHERE hs.storage_id = $SRC_STORAGE_ID
+            JOIN servers s ON s.hypervisor_id = h.id
+            JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
+            WHERE sd.hypervisor_storage_id = $SRC_HV_STORAGE_ID
+            GROUP BY h.id, h.name, h.ip_address
+            ORDER BY h.id
+        ")
+    else
+        hv_list=$(vfdb "
+            SELECT DISTINCT h.id, h.name, h.ip_address,
+                   COUNT(DISTINCT s.id) AS vm_count
+            FROM hypervisors h
+            JOIN servers s ON s.hypervisor_id = h.id
+            JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
+            JOIN server_disks_storage sds ON sds.id = sd.disk_storage_id
+            WHERE sds.storage_id = $SRC_STORAGE_ID
+            GROUP BY h.id, h.name, h.ip_address
             ORDER BY h.id
         ")
     fi
 
     if [ -z "$hv_list" ]; then
-        err "  No hypervisors found using storage $SRC_STORAGE_ID."
+        # Maybe no VMs yet, but still show hypervisors with this storage configured
+        if $SRC_IS_MOUNTPOINT; then
+            hv_list=$(vfdb "
+                SELECT DISTINCT h.id, h.name, h.ip_address, 0 AS vm_count
+                FROM hypervisors h
+                JOIN hypervisor_storage hs ON hs.hypervisor_id = h.id
+                WHERE hs.id = $SRC_HV_STORAGE_ID
+                ORDER BY h.id
+            ")
+        else
+            hv_list=$(vfdb "
+                SELECT DISTINCT h.id, h.name, h.ip_address, 0 AS vm_count
+                FROM hypervisors h
+                JOIN hypervisor_storage hs ON hs.hypervisor_id = h.id
+                WHERE hs.storage_id = $SRC_STORAGE_ID
+                ORDER BY h.id
+            ")
+        fi
+    fi
+
+    if [ -z "$hv_list" ]; then
+        err "  No hypervisors found using $SRC_STORAGE_NAME."
         exit 1
     fi
 
@@ -782,56 +843,103 @@ do_setup() {
         echo -e "  ${BOLD}Configure destination for hypervisor $h_id ($h_name):${NC}"
 
         # Show available destination storages for this hypervisor (excluding source)
-        local dest_storages
-        dest_storages=$(vfdb "
-            SELECT hs.id AS hv_storage_id, s.id AS storage_id, s.name, s.path
+        # Include both datastores and mountpoints
+        local dest_storages=""
+
+        # Datastores
+        local ds_list
+        ds_list=$(vfdb "
+            SELECT CONCAT('S', s.id) AS ref, s.name, s.data_1 AS path, 'datastore' AS stype, hs.id AS hs_id
             FROM hypervisor_storage hs
             JOIN storage s ON s.id = hs.storage_id
             WHERE hs.hypervisor_id = $h_id
-            AND s.id != $SRC_STORAGE_ID
+            AND hs.enabled = 1
             ORDER BY s.id
         ")
 
-        if [ -z "$dest_storages" ]; then
+        # Mountpoints
+        local mp_list
+        mp_list=$(vfdb "
+            SELECT CONCAT('M', hs.id) AS ref, hs.name, hs.path, 'mountpoint' AS stype, hs.id AS hs_id
+            FROM hypervisor_storage hs
+            WHERE hs.hypervisor_id = $h_id
+            AND hs.type = 'mountpoint'
+            AND hs.enabled = 1
+            ORDER BY hs.id
+        ")
+
+        dest_storages="${ds_list}"
+        [ -n "$mp_list" ] && dest_storages="${dest_storages}
+${mp_list}"
+
+        # Filter out the source from destination list
+        local filtered_dest=""
+        while IFS=$'\t' read -r d_ref d_name d_path d_type d_hs_id; do
+            [ -z "$d_ref" ] && continue
+            # Skip source
+            if $SRC_IS_MOUNTPOINT; then
+                [ "$d_ref" = "M${SRC_HV_STORAGE_ID}" ] && continue
+            else
+                [ "$d_ref" = "S${SRC_STORAGE_ID}" ] && continue
+            fi
+            filtered_dest="${filtered_dest}${d_ref}\t${d_name}\t${d_path}\t${d_type}\t${d_hs_id}\n"
+        done <<< "$dest_storages"
+
+        if [ -z "$filtered_dest" ]; then
             warn "    No other storage backends configured for $h_name — skipping"
             echo
             continue
         fi
 
         echo "    Available destination storages:"
-        while IFS=$'\t' read -r hs_id s_id s_name s_path; do
-            [ -z "$hs_id" ] && continue
-            printf "      %-4s %-30s %s\n" "$s_id" "$s_name" "$s_path"
-        done <<< "$dest_storages"
+        printf "      ${BOLD}%-6s %-30s %-30s %s${NC}\n" "ID" "Name" "Path" "Type"
+        echo -e "$filtered_dest" | while IFS=$'\t' read -r d_ref d_name d_path d_type d_hs_id; do
+            [ -z "$d_ref" ] && continue
+            printf "      %-6s %-30s %-30s %s\n" "$d_ref" "$d_name" "$d_path" "$d_type"
+        done
 
-        echo -en "    Select destination storage ID: "
-        read -r dst_storage_id
+        echo -en "    Select destination (e.g. S10 for datastore, M28 for mountpoint): "
+        read -r dst_ref
 
-        # Validate input is an integer (prevents SQL injection)
-        if ! [[ "$dst_storage_id" =~ ^[0-9]+$ ]]; then
-            err "    Invalid input — must be a numeric storage ID."
+        # Parse the destination reference
+        local dst_storage_id="" dst_hv_storage_id dst_path dst_is_mountpoint=false
+        if [[ "$dst_ref" =~ ^S([0-9]+)$ ]]; then
+            local dst_storage_id="${BASH_REMATCH[1]}"
+            local dst_info
+            dst_info=$(vfdb "
+                SELECT hs.id, s.data_1
+                FROM hypervisor_storage hs
+                JOIN storage s ON s.id = hs.storage_id
+                WHERE hs.hypervisor_id = $h_id
+                AND s.id = $dst_storage_id
+                LIMIT 1
+            ")
+            if [ -z "$dst_info" ]; then
+                err "    Storage S$dst_storage_id is not configured for hypervisor $h_name"
+                exit 1
+            fi
+            dst_hv_storage_id=$(echo "$dst_info" | awk '{print $1}')
+            dst_path=$(echo "$dst_info" | awk '{print $2}')
+        elif [[ "$dst_ref" =~ ^M([0-9]+)$ ]]; then
+            dst_is_mountpoint=true
+            dst_hv_storage_id="${BASH_REMATCH[1]}"
+            local dst_info
+            dst_info=$(vfdb "
+                SELECT id, path FROM hypervisor_storage
+                WHERE id = $dst_hv_storage_id
+                AND hypervisor_id = $h_id
+                AND type = 'mountpoint'
+                LIMIT 1
+            ")
+            if [ -z "$dst_info" ]; then
+                err "    Mountpoint M$dst_hv_storage_id is not configured for hypervisor $h_name"
+                exit 1
+            fi
+            dst_path=$(echo "$dst_info" | awk '{print $2}')
+        else
+            err "    Invalid input — use S<id> for datastore or M<id> for mountpoint."
             exit 1
         fi
-
-        # Resolve the hypervisor_storage ID and path for the chosen destination
-        local dst_info
-        dst_info=$(vfdb "
-            SELECT hs.id, s.path
-            FROM hypervisor_storage hs
-            JOIN storage s ON s.id = hs.storage_id
-            WHERE hs.hypervisor_id = $h_id
-            AND s.id = $dst_storage_id
-            LIMIT 1
-        ")
-
-        if [ -z "$dst_info" ]; then
-            err "    Storage $dst_storage_id is not configured for hypervisor $h_name"
-            exit 1
-        fi
-
-        local dst_hv_storage_id dst_path
-        dst_hv_storage_id=$(echo "$dst_info" | awk '{print $1}')
-        dst_path=$(echo "$dst_info" | awk '{print $2}')
 
         # SSH connectivity check
         echo -n "    SSH check to $h_ip... "
@@ -857,9 +965,10 @@ do_setup() {
         HV_IDS+=("$h_id")
         HV_NAMES[$h_id]="$h_name"
         HV_IPS[$h_id]="$h_ip"
-        HV_DST_STORAGE[$h_id]="$dst_storage_id"
+        HV_DST_STORAGE[$h_id]="${dst_storage_id:-}"
         HV_DST_HV_STORAGE[$h_id]="$dst_hv_storage_id"
         HV_DST_PATHS[$h_id]="$dst_path"
+        HV_DST_IS_MOUNTPOINT[$h_id]="$dst_is_mountpoint"
         echo
     done <<< "$hv_list"
 
@@ -1026,8 +1135,7 @@ resolve_vm() {
     NEW_STORAGE_ID="${HV_DST_STORAGE[$HV_ID]}"
     NEW_HV_STORAGE_ID="${HV_DST_HV_STORAGE[$HV_ID]}"
 
-    # Get source path from storage table
-    SRC_PATH=$(vfdb "SELECT path FROM storage WHERE id = $SRC_STORAGE_ID" | head -1)
+    # Get source path — already resolved during setup (handles both datastore and mountpoint)
 
     # Get disk IDs for DB updates
     DISK_DB_IDS=$(vfdb "SELECT GROUP_CONCAT(id) FROM server_disks WHERE server_id = $SERVER_DB_ID AND deleted_at IS NULL" | head -1)
@@ -1053,8 +1161,12 @@ UUID=$uuid
 VM_NAME=$VM_NAME
 HV_ID=$HV_ID
 HV_NAME=$HV_NAME
-SRC_STORAGE_ID=$SRC_STORAGE_ID
-DST_STORAGE_ID=$NEW_STORAGE_ID
+SRC_STORAGE_ID=${SRC_STORAGE_ID:-}
+SRC_HV_STORAGE_ID=${SRC_HV_STORAGE_ID:-}
+SRC_IS_MOUNTPOINT=$SRC_IS_MOUNTPOINT
+DST_STORAGE_ID=${NEW_STORAGE_ID:-}
+DST_HV_STORAGE_ID=$NEW_HV_STORAGE_ID
+DST_IS_MOUNTPOINT=${HV_DST_IS_MOUNTPOINT[$HV_ID]:-false}
 SRC_PATH=$SRC_PATH
 DST_PATH=$DST_PATH
 DEST_FORMAT=$DEST_FORMAT
@@ -1085,13 +1197,17 @@ do_rollback() {
 
     # Parse rollback config
     local orig_hv_storage_id orig_storage_id disk_ids disk_storage_ids orig_src_path orig_format
+    local rb_src_is_mountpoint rb_src_hv_storage_id
     orig_hv_storage_id=$(echo "$rb_data" | grep "^OLD_HV_STORAGE_ID=" | cut -d= -f2)
     orig_storage_id=$(echo "$rb_data" | grep "^OLD_STORAGE_ID=" | cut -d= -f2)
     disk_ids=$(echo "$rb_data" | grep "^DISK_DB_IDS=" | cut -d= -f2)
     disk_storage_ids=$(echo "$rb_data" | grep "^DISK_STORAGE_DB_IDS=" | cut -d= -f2)
     orig_src_path=$(echo "$rb_data" | grep "^SRC_PATH=" | cut -d= -f2)
     orig_format=$(echo "$rb_data" | grep "^ORIG_FORMAT=" | cut -d= -f2)
+    rb_src_is_mountpoint=$(echo "$rb_data" | grep "^SRC_IS_MOUNTPOINT=" | cut -d= -f2)
+    rb_src_hv_storage_id=$(echo "$rb_data" | grep "^SRC_HV_STORAGE_ID=" | cut -d= -f2)
     [ -z "$orig_format" ] && orig_format="qcow2"  # Default assumption for old rollback data
+    [ -z "$rb_src_is_mountpoint" ] && rb_src_is_mountpoint="false"
 
     info "Rollback: $VM_NAME ($uuid) on $HV_NAME"
     info "  Reverting disks from $DST_PATH back to $orig_src_path"
@@ -1130,20 +1246,41 @@ do_rollback() {
         else
             log "  Copying $target: $src_file -> $orig_file (offline, format: $orig_format)"
             hv_ssh_long "$HV_IP" "qemu-img convert -f raw -O $orig_format -p '$src_file' '$orig_file'" 2>&1
-            hv_ssh "$HV_IP" "chown qemu:qemu 2>/dev/null || chown libvirt-qemu:libvirt-qemu 2>/dev/null || chown 107:107 '$orig_file'" 2>/dev/null
+            hv_ssh "$HV_IP" "chown qemu:qemu '$orig_file' 2>/dev/null || chown libvirt-qemu:libvirt-qemu '$orig_file' 2>/dev/null || chown 107:107 '$orig_file'" 2>/dev/null
         fi
     done <<< "$disks"
 
     # Restore DB
     log "Restoring VirtFusion DB..."
     IFS=',' read -ra DIDS <<< "$disk_ids"
+
+    # Determine if original source was a mountpoint
+    local orig_is_mountpoint=false
+    if [ "$rb_src_is_mountpoint" = "true" ]; then
+        orig_is_mountpoint=true
+    elif [ -n "$orig_hv_storage_id" ]; then
+        local orig_hs_type
+        orig_hs_type=$(vfdb "SELECT type FROM hypervisor_storage WHERE id = $orig_hv_storage_id" | head -1)
+        [ "$orig_hs_type" = "mountpoint" ] && orig_is_mountpoint=true
+    fi
+
     for did in "${DIDS[@]}"; do
-        vfdb "UPDATE server_disks SET hypervisor_storage_id = $orig_hv_storage_id, type = '$orig_format' WHERE id = $did"
+        if $orig_is_mountpoint; then
+            # Original was mountpoint — restore with disk_storage_id=NULL
+            vfdb "UPDATE server_disks SET hypervisor_storage_id = $orig_hv_storage_id, disk_storage_id = NULL, type = '$orig_format' WHERE id = $did"
+        else
+            vfdb "UPDATE server_disks SET hypervisor_storage_id = $orig_hv_storage_id, type = '$orig_format' WHERE id = $did"
+        fi
     done
-    IFS=',' read -ra DSIDS <<< "$disk_storage_ids"
-    for dsid in "${DSIDS[@]}"; do
-        vfdb "UPDATE server_disks_storage SET storage_id = $orig_storage_id WHERE id = $dsid"
-    done
+
+    # Restore server_disks_storage (skip for mountpoint — disk_storage_id is NULL)
+    if ! $orig_is_mountpoint && [ -n "$disk_storage_ids" ]; then
+        IFS=',' read -ra DSIDS <<< "$disk_storage_ids"
+        for dsid in "${DSIDS[@]}"; do
+            [ -z "$dsid" ] && continue
+            vfdb "UPDATE server_disks_storage SET storage_id = $orig_storage_id WHERE id = $dsid"
+        done
+    fi
 
     # Restore persistent XML from backup
     log "Restoring persistent XML..."
@@ -1191,11 +1328,20 @@ migrate_one() {
     info "  VM state: $VM_STATE"
 
     # --- Check if already migrated ---
-    local current_storage
-    current_storage=$(vfdb "SELECT storage_id FROM server_disks_storage sds JOIN server_disks sd ON sd.disk_storage_id = sds.id WHERE sd.server_id = $SERVER_DB_ID AND sd.deleted_at IS NULL LIMIT 1" | head -1)
-    if [ "$current_storage" != "$SRC_STORAGE_ID" ]; then
-        info "  Already migrated (storage_id=$current_storage), skipping"
-        return 2  # 2 = skipped
+    if $SRC_IS_MOUNTPOINT; then
+        local current_hs_id
+        current_hs_id=$(vfdb "SELECT hypervisor_storage_id FROM server_disks WHERE server_id = $SERVER_DB_ID AND deleted_at IS NULL LIMIT 1" | head -1)
+        if [ "$current_hs_id" != "$SRC_HV_STORAGE_ID" ]; then
+            info "  Already migrated (hypervisor_storage_id=$current_hs_id), skipping"
+            return 2  # 2 = skipped
+        fi
+    else
+        local current_storage
+        current_storage=$(vfdb "SELECT storage_id FROM server_disks_storage sds JOIN server_disks sd ON sd.disk_storage_id = sds.id WHERE sd.server_id = $SERVER_DB_ID AND sd.deleted_at IS NULL LIMIT 1" | head -1)
+        if [ "$current_storage" != "$SRC_STORAGE_ID" ]; then
+            info "  Already migrated (storage_id=$current_storage), skipping"
+            return 2  # 2 = skipped
+        fi
     fi
 
     # --- Build disk list ---
@@ -1250,7 +1396,7 @@ migrate_one() {
 
     # --- Dry run exit ---
     if $DRY_RUN; then
-        info "  [DRY-RUN] Would migrate $TOTAL_H (DB: storage $SRC_STORAGE_ID->$NEW_STORAGE_ID, hv_storage $OLD_HV_STORAGE_ID->$NEW_HV_STORAGE_ID)"
+        info "  [DRY-RUN] Would migrate $TOTAL_H (DB: hv_storage $OLD_HV_STORAGE_ID->$NEW_HV_STORAGE_ID)"
         return 0
     fi
 
@@ -1274,7 +1420,9 @@ HV_IP=$HV_IP
 SRC_PATH=$SRC_PATH
 DST_PATH=$DST_PATH
 OLD_HV_STORAGE_ID=$OLD_HV_STORAGE_ID
-OLD_STORAGE_ID=$SRC_STORAGE_ID
+OLD_STORAGE_ID=${SRC_STORAGE_ID:-}
+SRC_IS_MOUNTPOINT=$SRC_IS_MOUNTPOINT
+SRC_HV_STORAGE_ID=${SRC_HV_STORAGE_ID:-}
 DISK_DB_IDS=$DISK_DB_IDS
 DISK_STORAGE_DB_IDS=$DISK_STORAGE_DB_IDS
 ORIG_FORMAT=$orig_format
@@ -1604,7 +1752,7 @@ ROLLBACK_CONF"
             fi
 
             # Fix ownership to qemu user (UID 107 on most systems)
-            hv_ssh "$HV_IP" "chown qemu:qemu 2>/dev/null || chown libvirt-qemu:libvirt-qemu 2>/dev/null || chown 107:107 '$dst_file'" 2>/dev/null || true
+            hv_ssh "$HV_IP" "chown qemu:qemu '$dst_file' 2>/dev/null || chown libvirt-qemu:libvirt-qemu '$dst_file' 2>/dev/null || chown 107:107 '$dst_file'" 2>/dev/null || true
             info "  $target: copied OK"
         done <<< "$DISK_LIST"
     fi
@@ -1634,21 +1782,30 @@ ROLLBACK_CONF"
     hv_ssh "$HV_IP" "virsh define $VFDATA/$uuid/server.xml 2>/dev/null" || true
 
     # --- Update VirtFusion DB ---
+    local dst_is_mp="${HV_DST_IS_MOUNTPOINT[$HV_ID]:-false}"
+
     # Update server_disks.hypervisor_storage_id to point to the new hypervisor-specific storage
     IFS=',' read -ra DIDS <<< "$DISK_DB_IDS"
     for did in "${DIDS[@]}"; do
-        vfdb "UPDATE server_disks SET hypervisor_storage_id = $NEW_HV_STORAGE_ID WHERE id = $did"
+        if [ "$dst_is_mp" = "true" ]; then
+            # Mountpoint storage: clear disk_storage_id (VF resolves path from hypervisor_storage.path)
+            vfdb "UPDATE server_disks SET hypervisor_storage_id = $NEW_HV_STORAGE_ID, disk_storage_id = NULL WHERE id = $did"
+        else
+            vfdb "UPDATE server_disks SET hypervisor_storage_id = $NEW_HV_STORAGE_ID WHERE id = $did"
+        fi
         # Update disk type if we converted
         if [ "$eff_format" != "preserve" ]; then
             vfdb "UPDATE server_disks SET type = '$eff_format' WHERE id = $did"
         fi
     done
 
-    # Update server_disks_storage.storage_id to point to the new storage backend
-    IFS=',' read -ra DSIDS <<< "$DISK_STORAGE_DB_IDS"
-    for dsid in "${DSIDS[@]}"; do
-        vfdb "UPDATE server_disks_storage SET storage_id = $NEW_STORAGE_ID WHERE id = $dsid"
-    done
+    # Update server_disks_storage.storage_id (skip for mountpoint — disk_storage_id is NULL)
+    if [ "$dst_is_mp" != "true" ]; then
+        IFS=',' read -ra DSIDS <<< "$DISK_STORAGE_DB_IDS"
+        for dsid in "${DSIDS[@]}"; do
+            vfdb "UPDATE server_disks_storage SET storage_id = $NEW_STORAGE_ID WHERE id = $dsid"
+        done
+    fi
 
     # Show final VM state
     local final_state
@@ -1671,6 +1828,35 @@ ROLLBACK_CONF"
 
     local migration_elapsed=$(( $(date +%s) - migration_start ))
 
+    # --- Post-migration DB validation ---
+    local db_valid=true
+    local db_hs_id db_ds_id
+    db_hs_id=$(vfdb "SELECT hypervisor_storage_id FROM server_disks WHERE server_id = $SERVER_DB_ID AND deleted_at IS NULL LIMIT 1" | head -1)
+    db_ds_id=$(vfdb "SELECT disk_storage_id FROM server_disks WHERE server_id = $SERVER_DB_ID AND deleted_at IS NULL LIMIT 1" | head -1)
+
+    if [ "$db_hs_id" = "$NEW_HV_STORAGE_ID" ]; then
+        info "  [OK] DB hypervisor_storage_id: $db_hs_id"
+    else
+        err "  [FAIL] DB hypervisor_storage_id: expected $NEW_HV_STORAGE_ID, got $db_hs_id"
+        db_valid=false
+    fi
+
+    local dst_is_mp="${HV_DST_IS_MOUNTPOINT[$HV_ID]:-false}"
+    if [ "$dst_is_mp" = "true" ]; then
+        if [ -z "$db_ds_id" ] || [ "$db_ds_id" = "NULL" ]; then
+            info "  [OK] DB disk_storage_id: NULL (mountpoint)"
+        else
+            err "  [FAIL] DB disk_storage_id: expected NULL for mountpoint, got $db_ds_id"
+            db_valid=false
+        fi
+    else
+        info "  [OK] DB disk_storage_id: $db_ds_id"
+    fi
+
+    if ! $db_valid; then
+        warn "  DB validation failed — VM migrated but DB state may need manual fix"
+    fi
+
     # Record migration for verify/report/cleanup
     record_migration "$uuid" "$TOTAL_SIZE" "$dst_total_size" "$migration_elapsed"
 
@@ -1689,7 +1875,7 @@ ROLLBACK_CONF"
 # =====================================================================
 
 do_batch() {
-    log "=== Batch Migration: All VMs on source storage (storage_id=$SRC_STORAGE_ID) ==="
+    log "=== Batch Migration: All VMs on $SRC_STORAGE_NAME ($SRC_PATH) ==="
     echo
 
     # Build the hypervisor filter clause
@@ -1706,15 +1892,28 @@ do_batch() {
 
     # Query all VMs with disks still on source storage
     local vm_list
-    vm_list=$(vfdb "
-        SELECT DISTINCT s.uuid, s.name, s.hypervisor_id
-        FROM servers s
-        JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
-        JOIN server_disks_storage sds ON sds.id = sd.disk_storage_id
-        WHERE sds.storage_id = $SRC_STORAGE_ID
-        $hv_filter
-        ORDER BY s.hypervisor_id, s.id
-    ")
+    if $SRC_IS_MOUNTPOINT; then
+        vm_list=$(vfdb "
+            SELECT s.uuid, s.name, s.hypervisor_id, SUM(sd.size) AS total_disk_gb
+            FROM servers s
+            JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
+            WHERE sd.hypervisor_storage_id = $SRC_HV_STORAGE_ID
+            $hv_filter
+            GROUP BY s.id, s.uuid, s.name, s.hypervisor_id
+            ORDER BY SUM(sd.size) ASC
+        ")
+    else
+        vm_list=$(vfdb "
+            SELECT s.uuid, s.name, s.hypervisor_id, SUM(sd.size) AS total_disk_gb
+            FROM servers s
+            JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
+            JOIN server_disks_storage sds ON sds.id = sd.disk_storage_id
+            WHERE sds.storage_id = $SRC_STORAGE_ID
+            $hv_filter
+            GROUP BY s.id, s.uuid, s.name, s.hypervisor_id
+            ORDER BY SUM(sd.size) ASC
+        ")
+    fi
 
     if [ -z "$vm_list" ]; then
         log "No VMs found on source storage. All migrated!"
@@ -1725,11 +1924,13 @@ do_batch() {
     local -a ALL_UUIDS=()
     local -a ALL_NAMES=()
     local -a ALL_HVS=()
-    while IFS=$'\t' read -r vm_uuid vm_name vm_hv; do
+    local -a ALL_SIZES=()
+    while IFS=$'\t' read -r vm_uuid vm_name vm_hv vm_size; do
         [ -z "$vm_uuid" ] && continue
         ALL_UUIDS+=("$vm_uuid")
         ALL_NAMES+=("$vm_name")
         ALL_HVS+=("$vm_hv")
+        ALL_SIZES+=("$vm_size")
     done <<< "$vm_list"
 
     local total_vms=${#ALL_UUIDS[@]}
@@ -1739,17 +1940,17 @@ do_batch() {
     for hv_id in "${HV_IDS[@]}"; do
         local count=0
         for h in "${ALL_HVS[@]}"; do
-            [ "$h" = "$hv_id" ] && ((count++))
+            [ "$h" = "$hv_id" ] && ((count++)) || true
         done
         [ $count -gt 0 ] && info "  ${HV_NAMES[$hv_id]}: $count VMs"
     done
     echo
 
     # Show VM list
-    info "VM List:"
+    info "VM List (sorted smallest → largest):"
     for i in "${!ALL_UUIDS[@]}"; do
         local hv_label="${HV_NAMES[${ALL_HVS[$i]}]:-hv-${ALL_HVS[$i]}}"
-        info "  $((i+1)). ${ALL_NAMES[$i]} (${ALL_UUIDS[$i]}) on $hv_label"
+        info "  $((i+1)). ${ALL_NAMES[$i]} (${ALL_UUIDS[$i]}) on $hv_label — ${ALL_SIZES[$i]}GB"
     done
     echo
 
@@ -1804,15 +2005,15 @@ do_batch() {
                     if kill -0 "${pids[$pi]}" 2>/dev/null; then
                         new_pids+=("${pids[$pi]}")
                         new_pid_uuids+=("${pid_uuids[$pi]}")
-                        ((new_running++))
+                        ((new_running++)) || true
                     else
                         # Check exit code
                         wait "${pids[$pi]}" 2>/dev/null || true
                         local rc=$?
                         case $rc in
-                            0) ((migrated++)) ;;
-                            2) ((skipped++)) ;;
-                            *) ((failed++)) ;;
+                            0) ((migrated++)) || true ;;
+                            2) ((skipped++)) || true ;;
+                            *) ((failed++)) || true ;;
                         esac
                     fi
                 done
@@ -1833,9 +2034,9 @@ do_batch() {
             wait "${pids[$pi]}" 2>/dev/null || true
             local rc=$?
             case $rc in
-                0) ((migrated++)) ;;
-                2) ((skipped++)) ;;
-                *) ((failed++)) ;;
+                0) ((migrated++)) || true ;;
+                2) ((skipped++)) || true ;;
+                *) ((failed++)) || true ;;
             esac
         done
 
@@ -1855,9 +2056,9 @@ do_batch() {
             set -e
 
             case $rc in
-                0) ((migrated++)) ;;
-                2) ((skipped++)) ;;
-                *) ((failed++)); warn "Failed to migrate $vm_name — continuing with next VM" ;;
+                0) ((migrated++)) || true ;;
+                2) ((skipped++)) || true ;;
+                *) ((failed++)) || true; warn "Failed to migrate $vm_name — continuing with next VM" ;;
             esac
 
             # Batch ETA calculation
@@ -1974,24 +2175,43 @@ do_verify() {
             done <<< "$disks"
         fi
 
-        # Check 3: DB matches
-        local db_storage
-        db_storage=$(vfdb "
-            SELECT sds.storage_id
+        # Check 3: DB matches — check hypervisor_storage_id (works for both mountpoint and datastore)
+        local v_dst_hv_storage_id="${DST_HV_STORAGE_ID:-}"
+        local db_hv_storage
+        db_hv_storage=$(vfdb "
+            SELECT sd.hypervisor_storage_id
             FROM servers s
             JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
-            JOIN server_disks_storage sds ON sds.id = sd.disk_storage_id
             WHERE s.uuid = '$v_uuid'
             LIMIT 1
         " | head -1)
 
-        if [ "$db_storage" = "$v_dst_storage_id" ]; then
-            log "  [OK] DB storage_id: $db_storage"
-        elif [ -z "$db_storage" ]; then
+        if [ -z "$db_hv_storage" ]; then
             warn "  VM not found in DB (may be destroyed)"
+        elif [ "$db_hv_storage" = "$v_dst_hv_storage_id" ]; then
+            log "  [OK] DB hypervisor_storage_id: $db_hv_storage"
         else
-            err "  [FAIL] DB storage_id: expected $v_dst_storage_id, got $db_storage"
+            err "  [FAIL] DB hypervisor_storage_id: expected $v_dst_hv_storage_id, got $db_hv_storage"
             v_ok=false
+        fi
+
+        # For mountpoint destinations, verify disk_storage_id is NULL
+        local v_dst_is_mp="${DST_IS_MOUNTPOINT:-false}"
+        if [ "$v_dst_is_mp" = "true" ]; then
+            local db_disk_storage
+            db_disk_storage=$(vfdb "
+                SELECT sd.disk_storage_id
+                FROM servers s
+                JOIN server_disks sd ON sd.server_id = s.id AND sd.deleted_at IS NULL
+                WHERE s.uuid = '$v_uuid'
+                LIMIT 1
+            " | head -1)
+            if [ -z "$db_disk_storage" ] || [ "$db_disk_storage" = "NULL" ]; then
+                log "  [OK] disk_storage_id: NULL (mountpoint)"
+            else
+                err "  [FAIL] disk_storage_id should be NULL for mountpoint, got $db_disk_storage"
+                v_ok=false
+            fi
         fi
 
         if $v_ok; then
